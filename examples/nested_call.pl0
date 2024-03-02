@@ -1,0 +1,26 @@
+procedure A1;
+   procedure B1;
+   begin
+      print 21;
+      call A2
+   end;
+   procedure B2;
+   begin
+      print 22;
+      call B1
+   end;
+begin
+   print 11;
+   call B2
+end;
+
+procedure A2;
+begin
+   print 12
+end;
+
+begin
+   call A1
+end.
+
+

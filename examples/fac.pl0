@@ -1,0 +1,16 @@
+var x, n;
+procedure fac; begin
+   while x > 0 do begin
+      n := n * x;
+      x := x - 1
+   end
+end;
+
+begin
+   n := 1;
+   input x;
+   ;;;
+   call fac;
+   print n;
+end.
+

@@ -1,0 +1,10 @@
+procedure proc(blah1, a);
+begin
+  print a;
+  print blah1;
+  print a + blah1;
+end;
+
+begin
+  call proc(3, 4);
+end.

@@ -1,0 +1,12 @@
+var x;
+procedure A1;
+begin
+  x := 3
+end;
+
+begin
+  x := 4;
+  print x;
+  call A1;
+  print x
+end.

@@ -87,15 +87,11 @@ proc lookupVar(name: string, layerCount: int, env: Env): Option[(int, int)] =
   var i = env.len()-1
   while i >= 0:
     var t = env[i].varTable
-    if t == nil:
-      t = env[i].argTable
-      if t == nil:
-        i -= 1
-        continue
-    if not t.hasKey(name):
-      i -= 1
-      continue
-    return some((layerCount-i, t[name][1]))
+    if t != nil and t.hasKey(name): return some((layerCount-1, t[name][1]))
+    t = env[i].argTable
+    if t != nil and t.hasKey(name): return some((layerCount-1, t[name][1]))
+    i -= 1
+    continue
   return none((int, int))
 
 proc lookupProc(env: Env, name: string, layerCount: int): Option[tuple[loc: int, arity: int]] =

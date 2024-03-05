@@ -35,6 +35,17 @@ type
       relOp*: string
       relLhs*: Expr
       relRhs*: Expr
+  LValueType* = enum
+    LV_VAR
+    LV_DEREF
+  LValue* = ref object
+    line*: int
+    col*: int
+    case lvType*: LValueType
+    of LV_VAR:
+      vName*: string
+    of LV_DEREF:
+      drBody*: Expr
   StatementType* = enum
     S_ASSIGN
     S_CALL
@@ -49,7 +60,7 @@ type
     col*: int
     case sType*: StatementType
     of S_ASSIGN:
-      aTarget*: string
+      aTarget*: LValue
       aVal*: Expr
     of S_CALL:
       cTarget*: string

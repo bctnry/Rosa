@@ -87,9 +87,9 @@ proc lookupVar(name: string, layerCount: int, env: Env): Option[(int, int)] =
   var i = env.len()-1
   while i >= 0:
     var t = env[i].varTable
-    if t != nil and t.hasKey(name): return some((layerCount-1, t[name][1]))
+    if t != nil and t.hasKey(name): return some((layerCount-i, t[name][1]))
     t = env[i].argTable
-    if t != nil and t.hasKey(name): return some((layerCount-1, t[name][1]))
+    if t != nil and t.hasKey(name): return some((layerCount-i, t[name][1]))
     i -= 1
     continue
   return none((int, int))
@@ -134,11 +134,26 @@ proc compileExpr(x: Expr, layerCount: int, env: Env): seq[Instr] =
                     else: -1  # cannot happen
       res.add((OPR, 0, opNum))
     of E_UNARYOP:
-      res &= x.uBody.compileExpr(layerCount, env)
-      let opNum = case x.uOp:
-                    of "-": 1
-                    else: -1  # cannot happend
-      res.add((OPR, 0, opNum))
+      # NOTE: "ref" needs to be handled differently since when taking the
+      # ref of a variable we don't actually evaluate that variable.
+      case x.uOp:
+        of "ref":
+          # now we extract the variable name. due to how we handle the
+          # parsing we won't have anything but ast for variable here.
+          assert(x.uBody.eType == E_VAR)
+          var lookupRes = lookupVar(x.uBody.vName, layerCount, env)
+          if lookupRes.isNone():
+            x.raiseErrorWithReason(&"Variable {x.uBody.vName} is not defined.")
+          res.add((REF, lookupRes.get()[0], lookupRes.get()[1]))
+        else:
+          res &= x.uBody.compileExpr(layerCount, env)
+          case x.uOp:
+            of "-":
+              res.add((OPR, 0, 1))
+            of "valof":
+              res.add((DEREF, 0, 0))
+            else:
+              discard  # cannot happen.
     of E_LIT:
       res.add((LIT, 0, x.lVal))
     of E_VAR:
@@ -238,10 +253,28 @@ proc compileStatement(x: Statement, currentLoc: int, layerCount: int, env: Env):
   var callFillers: seq[(int, int, string)] = @[]
   case x.sType:
     of S_ASSIGN:
-      let resolveRes = lookupVar(x.aTarget, layerCount, env)
-      if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.aTarget} not found.")
-      res &= x.aVal.compileExpr(layerCount, env)
-      res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
+      case x.aTarget.lvType:
+        of LV_VAR:
+          let resolveRes = lookupVar(x.aTarget.vName, layerCount, env)
+          echo resolveRes
+          if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.aTarget.vName} not found.")
+          res &= x.aVal.compileExpr(layerCount, env)
+          res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
+        of LV_DEREF:
+          res &= x.aVal.compileExpr(layerCount, env)
+          var lhsRes = x.aTarget.drBody.compileExpr(layerCount, env)
+          # NOTE: this is a little complicated to explain. Consider the lhs `A[]`,
+          # we would expect the value of `A` to be on top of the stack; with the
+          # lhs `A[][]`, this value should be `valof A`; with lhs `A[][][]`, this
+          # value should be `valof valof A`; etc.. A way to reuse currently-existing
+          # code is to treat `[]` as `valof`, compile the whole thing as an expr,
+          # and remove the last `valof` operation (which compiles to a single
+          # `DEREF` instruction.
+          assert(lhsRes[^1][0] == DEREF)
+          discard lhsRes.pop()
+          res &= lhsRes
+          res.add((POPA, 0, 0))
+          res.add((POPR, 0, 0))
     of S_BLOCK:
       let s = compileStatementList(x.body, currentLoc, layerCount, env)
       res &= s[0]

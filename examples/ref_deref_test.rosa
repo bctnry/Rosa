@@ -1,0 +1,25 @@
+procedure A;
+  var alocal;
+begin
+    alocal := 1000;
+    print alocal;  (* should print 1000 *)
+    call B(ref alocal);
+    print alocal;  (* should print 4 *)
+end;
+
+procedure B(refx);
+begin
+    print refx;  (* should print addr of refx *)
+    print valof refx;  (* should print 1000 *)
+    refx[][] := 5;
+    print valof valof refx;  (* should print 5 *)
+    print valof 1000;  (* should print 5 *)
+    1000[] := 2000;
+    print valof valof refx;  (* should print 2000 *)
+    refx[] := 4;
+    print valof refx;  (* should print 4 *)
+end;
+
+begin
+    call A;
+end.

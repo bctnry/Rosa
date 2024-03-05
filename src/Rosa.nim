@@ -16,6 +16,9 @@ when isMainModule:
   let parseRes = parseProgram(source)
   if parseRes.isSome():
     let compileRes = parseRes.get.compileProgram
-    # for k in compileRes: echo k
+    var i = 0
+    # while i < compileRes.len:
+      # echo i, " ", compileRes[i]
+      # i += 1
     loadVM(compileRes).runVM
   

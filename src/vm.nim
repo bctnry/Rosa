@@ -14,6 +14,9 @@ type
     POP
     POPA
     PUSHA
+    REF
+    DEREF
+    POPR
   Instr* = (InstrType, int, int)
 
 proc `$`*(x: InstrType): string =
@@ -29,6 +32,9 @@ proc `$`*(x: InstrType): string =
     of POP: "POP"
     of POPA: "POPA"
     of PUSHA: "PUSHA"
+    of REF: "REF"
+    of DEREF: "DEREF"
+    of POPR: "POPR"
 
 type
   VM* = ref object
@@ -171,6 +177,18 @@ proc runVM*(vm: VM): void =
       of POPA:
         vm.a = vm.stkmem[vm.stk]
         vm.stk -= 1
+        vm.pc += 1
+      of REF:
+        vm.stk += 1
+        vm.stkmem[vm.stk] = vm.traceStaticLink(vm.base, iLayer) + iArg
+        vm.pc += 1
+      of DEREF:
+        vm.stkmem[vm.stk] = vm.stkmem[vm.stkmem[vm.stk]]
+        vm.pc += 1
+      of POPR:
+        vm.stkmem[vm.a] = vm.stkmem[vm.stk]
+        vm.stk -= 1
+        vm.pc += 1
 
 # NOTE THAT in the definition of JPC we jump when the stacktop is *0* but the
 # comparison operators leave *1* at the stack top when the conditio holds;

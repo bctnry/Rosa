@@ -256,7 +256,6 @@ proc compileStatement(x: Statement, currentLoc: int, layerCount: int, env: Env):
       case x.aTarget.lvType:
         of LV_VAR:
           let resolveRes = lookupVar(x.aTarget.vName, layerCount, env)
-          echo resolveRes
           if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.aTarget.vName} not found.")
           res &= x.aVal.compileExpr(layerCount, env)
           res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
@@ -300,10 +299,19 @@ proc compileStatement(x: Statement, currentLoc: int, layerCount: int, env: Env):
       res.add((JMP, 0, l1))
       callFillers &= bodyPart[1]
     of S_INPUT:
-      let resolveRes = lookupVar(x.iTarget, layerCount, env)
-      if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.iTarget} not found")
       res.add((OPR, 0, 7))
-      res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
+      case x.iTarget.lvType:
+        of LV_VAR:
+          let resolveRes = lookupVar(x.iTarget.vName, layerCount, env)
+          if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.iTarget.vName} not found")
+          res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
+        of LV_DEREF:
+          var lhsRes = x.iTarget.drBody.compileExpr(layerCount, env)
+          assert(lhsRes[^1][0] == DEREF)
+          discard lhsRes.pop()
+          res &= lhsRes
+          res.add((POPA, 0, 0))
+          res.add((POPR, 0, 0))
     of S_PRINT:
       res &= compileExpr(x.pExpr, layerCount, env)
       res.add((OPR, 0, 14))

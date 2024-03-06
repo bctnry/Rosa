@@ -16,6 +16,8 @@ begin
     print valof 1000;  (* should print 5 *)
     1000[] := 2000;
     print valof valof refx;  (* should print 2000 *)
+    input refx[][];
+    print valof valof refx;  (* should print the user's input. *)
     refx[] := 4;
     print valof refx;  (* should print 4 *)
 end;

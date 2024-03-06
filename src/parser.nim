@@ -269,8 +269,8 @@ proc parseStatement(x: ParserState): Option[Statement] =
     return some(Statement(line: x.line, col: x.col, sType: S_CALL, cTarget: target.get(), cArgs: argList))
   if x.skipWhite.peek("input"):
     discard x.skipWhite.expect("input")
-    var target = x.skipWhite.takeIdent()
-    if target.isNone(): x.raiseErrorWithReason("Identifier expected.")
+    var target = x.skipWhite.parseLValue()
+    if target.isNone(): x.raiseErrorWithReason("Proper lvalue expected.")
     return some(Statement(line: x.line, col: x.col, sType: S_INPUT, iTarget: target.get()))
   if x.skipWhite.peek("print"):
     discard x.skipWhite.expect("print")

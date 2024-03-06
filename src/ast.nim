@@ -66,7 +66,7 @@ type
       cTarget*: string
       cArgs*: seq[Expr]
     of S_INPUT:
-      iTarget*: string
+      iTarget*: LValue
     of S_PRINT:
       pExpr*: Expr
     of S_BLOCK:

@@ -88,10 +88,12 @@ type
     col*: int
     constDef*: seq[(string, int)]
     varDef*: seq[string]
-    procDef*: seq[ProcDef]
     body*: Statement
   Program* = ref object
-    body*: Block
+    constDef*: seq[(string, int)]
+    varDef*: seq[string]
+    procDef*: seq[ProcDef]
+    body*: Statement
       
 proc raiseErrorWithReason*(x: Expr, reason: string): void =
   raise newException(ValueError, &"[Compiler] ({x.line},{x.col}) {reason}")

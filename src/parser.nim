@@ -389,19 +389,23 @@ proc parseProcClause(x: ParserState): Option[seq[ProcDef]] =
 proc parseBlock(x: ParserState): Option[Block] =
   var constClause = x.skipWhite.parseConstClause
   var varClause = x.skipWhite.parseVarClause
-  var procClause = x.skipWhite.parseProcClause
   var body = x.skipWhite.parseStatement
   if body.isNone(): x.raiseErrorWithReason("Statement expected.")
   return some(Block(line: x.line, col: x.col,
                     constDef: if constClause.isNone(): @[] else: constClause.get(),
                     varDef: if varClause.isNone(): @[] else: varClause.get(),
-                    procDef: if procClause.isNone(): @[] else: procClause.get(),
                     body: body.get()))
 
 proc parseProgram(x: ParserState): Option[Program] =
-  var blockRes = x.skipWhite.parseBlock
-  if x.skipWhite.expect(".").isNone(): x.raiseErrorWithReason("\".\" expected.")
-  return some(Program(body: blockRes.get()))
+  var constClause = x.skipWhite.parseConstClause
+  var varClause = x.skipWhite.parseVarClause
+  var procClause = x.skipWhite.parseProcClause
+  var body = x.skipWhite.parseStatement
+  if body.isNone(): x.raiseErrorWithReason("Statement expected.")
+  return some(Program(constDef: if constClause.isNone(): @[] else: constClause.get(),
+                      varDef: if varClause.isNone(): @[] else: varClause.get(),
+                      procDef: if procClause.isNone(): @[] else: procClause.get(),
+                      body: body.get()))
 
 proc parseProgram*(x: string): Option[Program] =
   ParserState(line: 0, col: 0, x: x, stp: 0).parseProgram

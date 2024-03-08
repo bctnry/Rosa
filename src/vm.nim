@@ -17,7 +17,9 @@ type
     REF
     DEREF
     POPR
-  Instr* = (InstrType, int, int)
+    LODA
+    STOA
+  Instr* = (InstrType, int)
 
 proc `$`*(x: InstrType): string =
   case x:
@@ -35,6 +37,8 @@ proc `$`*(x: InstrType): string =
     of REF: "REF"
     of DEREF: "DEREF"
     of POPR: "POPR"
+    of LODA: "LODA"
+    of STOA: "STOA"
 
 type
   VM* = ref object
@@ -53,20 +57,11 @@ proc loadVM*(program: seq[Instr]): VM =
      a: 0)
     
 proc runVM*(vm: VM): void =
-  # NOTE: this traces the static link)
-  proc traceStaticLink(vm: VM, currentBase: int, layerCount: int): int =
-    var subj = currentBase
-    var lc = layerCount
-    while lc > 0:
-      subj = vm.stkmem[subj]
-      lc -= 1
-    return subj
     
   while vm.pc < vm.program.len:
     let i = vm.program[vm.pc]
     let iType = i[0]
-    let iLayer = i[1]
-    let iArg = i[2]
+    let iArg = i[1]
     case iType:
       of LIT:
         vm.stk += 1
@@ -76,12 +71,11 @@ proc runVM*(vm: VM): void =
         case iArg:
           of 0:  # return
             # prev. stktop
-            # static link
             # dynamic link
             # retaddr
             vm.stk = vm.base-1
-            vm.pc = vm.stkmem[vm.stk+3]
-            vm.base = vm.stkmem[vm.stk+2]
+            vm.pc = vm.stkmem[vm.stk+2]
+            vm.base = vm.stkmem[vm.stk+1]
           of 1:
             vm.stkmem[vm.stk] = -vm.stkmem[vm.stk]
             vm.pc += 1
@@ -144,19 +138,26 @@ proc runVM*(vm: VM): void =
             raise newException(ValueError, &"[VM] Unsupported OPR function: {iArg}")
       of LOD:
         vm.stk += 1
-        vm.stkmem[vm.stk] = vm.stkmem[vm.traceStaticLink(vm.base, iLayer) + iArg]
+        vm.stkmem[vm.stk] = vm.stkmem[vm.base + iArg]
+        vm.pc += 1
+      of LODA:
+        vm.stk += 1
+        vm.stkmem[vm.stk] = vm.stkmem[iArg]
         vm.pc += 1
       of STO:
-        vm.stkmem[vm.traceStaticLink(vm.base, iLayer) + iArg] = vm.stkmem[vm.stk]
+        vm.stkmem[vm.base + iArg] = vm.stkmem[vm.stk]
+        vm.stk -= 1
+        vm.pc += 1
+      of STOA:
+        vm.stkmem[iArg] = vm.stkmem[vm.stk]
         vm.stk -= 1
         vm.pc += 1
       of CAL:
-        vm.stkmem[vm.stk+1] = vm.traceStaticLink(vm.base, iLayer)
-        vm.stkmem[vm.stk+2] = vm.base
-        vm.stkmem[vm.stk+3] = vm.pc+1
+        vm.stkmem[vm.stk+1] = vm.base
+        vm.stkmem[vm.stk+2] = vm.pc+1
         vm.base = vm.stk+1
         vm.pc = iArg
-        vm.stk = vm.stk+3
+        vm.stk = vm.stk+2
       of INT:
         vm.stk += iArg
         vm.pc += 1
@@ -180,7 +181,7 @@ proc runVM*(vm: VM): void =
         vm.pc += 1
       of REF:
         vm.stk += 1
-        vm.stkmem[vm.stk] = vm.traceStaticLink(vm.base, iLayer) + iArg
+        vm.stkmem[vm.stk] = vm.base + iArg
         vm.pc += 1
       of DEREF:
         vm.stkmem[vm.stk] = vm.stkmem[vm.stkmem[vm.stk]]

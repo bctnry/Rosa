@@ -3,98 +3,67 @@ import std/options
 import ast
 import vm
 import transform/transform
+import prettyprint
 from std/enumerate import enumerate
 from std/strformat import `&`
 
 
-proc collectConst(x: Block): TableRef[string, int] =
+proc collectConst(x: seq[(string, int)]): TableRef[string, int] =
   var res = newTable[string, int]()
-  for v in x.constDef:
+  for v in x:
     res[v[0]] = v[1]
   return res
-
-# The idea of this part goes as follows:
-# When the compiler descends into the nesting procedure
-# is maintained; one can get the "layer offset" by subtracting layer count and
-# variable base even if everything is strictly increasing; to see why "increasing"
-# would be a problem, consider the following example:
-#
-#     procedure A;
-#       var a;  (* Considered base 0 *)
-#       procedure B;
-#         var b;  (* Considered base 1 *)
-#         procedure C;
-#           var c;  (* Considered base 2 *)
-#           procedure D;
-#             var d;  (* Considered base 3 *)
-#           begin
-#             a := c + d;  (* point A *)
-#           end;
-#         begin
-#           a := b + c;  (* point B *)
-#         end;
-#       begin
-#         a := a + b;  (* point C *)
-#       end;
-#     ...
-#
-# Due to how the vm works and how the stack frame is laid out, the way the
-# variable `a` should be referred to is different between point A, B and C:
-# at point A, `a` should be `STO 3, 0`; at point B, `a` should be `STO 2, 0`;
-# at point C, `a` should be `STO 1, 0`. If we choose to build the location
-# mapping as we descent, we'll need to change the layer count every time we
-# descend a layer; this may not be too big of a problem since deeply-nested
-# procedures are rare, but it's troublesome and prone to err to do this.
-# If we maintain a "layer count" variable as we descend, variables
-# like `a`, `b`, `c` and `d` can simply be `(0, 0)`, `(1, 0)`, `(2, 0)`
-# and `(3, 0)` and one can retrieve the correct layer count for `LOD` and `STO`
-# anytime by subtracting the base from the layer count variable, e.g. at
-# point A the layer count is 3 (starts from 0) and one can get the base for `a`
-# by `3-0 = 3` and the base for c by `3-2 = 1`.
-
+  
 type
-  # this field is defined as a seq for easy maintaining between many nested
-  # procedures.
   EnvFrame = tuple
     constTable: TableRef[string, int]
-    varTable: TableRef[string, (int, int)]
+    globalTable: TableRef[string, int]
+    varTable: TableRef[string, int]
     procTable: TableRef[string, tuple[loc: int, arity: int]]
-    argTable: TableRef[string, (int, int)]
+    argTable: TableRef[string, int]
   Env = seq[EnvFrame]
   
-proc allocVar(x: Block, base: int): TableRef[string, (int, int)] =
-  var res = newTable[string, (int, int)]()
-  for (i, v) in enumerate(x.varDef):
-    res[v] = (base, i)
+proc allocVar(x: seq[string]): TableRef[string, int] =
+  var res = newTable[string, int]()
+  for (i, v) in enumerate(x):
+    res[v] = i
   return res
 
 # NOTE: for args #0, #1, #2, ..., #n-1 we assign offset -(n), -(n-1), ..., -1
 # since base pointer points to the static link field.
-proc assignParams(x: ProcDef, base: int): TableRef[string, (int, int)] =
-  var res = newTable[string, (int, int)]()
+proc assignParams(x: ProcDef): TableRef[string, int] =
+  var res = newTable[string, int]()
   let paramLen = x.paramList.len
   var i = -paramLen
   for v in x.paramList:
-    res[v] = (base, i)
+    res[v] = i
     i += 1
   return res
 
-# NOTE: this returns "resolved location", i.e. the one you directly plugs
-# into `STO` and `LOD`.
 # NOTE: this looks up argTable as well.
-proc lookupVar(name: string, layerCount: int, env: Env): Option[(int, int)] =
-  assert(layerCount == env.len()-1)
+proc lookupVar(name: string, env: Env): Option[int] =
   var i = env.len()-1
   while i >= 0:
     var t = env[i].varTable
-    if t != nil and t.hasKey(name): return some((layerCount-i, t[name][1]))
+    if t != nil and t.hasKey(name): return some(t[name])
     t = env[i].argTable
-    if t != nil and t.hasKey(name): return some((layerCount-i, t[name][1]))
+    if t != nil and t.hasKey(name): return some(t[name])
     i -= 1
     continue
-  return none((int, int))
+  return none(int)
 
-proc lookupProc(env: Env, name: string, layerCount: int): Option[tuple[loc: int, arity: int]] =
+proc lookupGlobal(name: string, env: Env): Option[int] =
+  var i = env.len()-1
+  while i >= 0:
+    var t = env[i].globalTable
+    if t != nil and t.hasKey(name): return some(t[name])
+    t = env[i].argTable
+    if t != nil and t.hasKey(name): return some(t[name])
+    i -= 1
+    continue
+  return none(int)
+
+proc lookupProc(env: Env, name: string): Option[tuple[loc: int, arity: int]] =
   var i = env.len()-1
   while i >= 0:
     let t = env[i].procTable
@@ -120,66 +89,80 @@ proc lookupConst(name: string, env: Env): Option[int] =
     return some(t[name])
   return none(int)
 
-proc compileExpr(x: Expr, layerCount: int, env: Env): seq[Instr] =
+proc compileExpr(x: Expr, env: Env): seq[Instr] =
   var res: seq[Instr] = @[]
-  case x.eType:
-    of E_BINOP:
-      res &= x.bLhs.compileExpr(layerCount, env)
-      res &= x.bRhs.compileExpr(layerCount, env)
-      let opNum = case x.binop:
-                    of "+": 2
-                    of "-": 3
-                    of "*": 4
-                    of "/": 5
-                    else: -1  # cannot happen
-      res.add((OPR, 0, opNum))
-    of E_UNARYOP:
-      # NOTE: "ref" needs to be handled differently since when taking the
-      # ref of a variable we don't actually evaluate that variable.
-      case x.uOp:
-        of "ref":
+  block dispatch:
+    case x.eType:
+      of E_BINOP:
+        res &= x.bLhs.compileExpr(env)
+        res &= x.bRhs.compileExpr(env)
+        let opNum = case x.binop:
+                      of "+": 2
+                      of "-": 3
+                      of "*": 4
+                      of "/": 5
+                      else: -1  # cannot happen
+        res.add((OPR, opNum))
+      of E_UNARYOP:
+        # NOTE: "ref" needs to be handled differently since when taking the
+        # ref of a variable we don't actually evaluate that variable.
+        if x.uOp == "ref":
           # now we extract the variable name. due to how we handle the
           # parsing we won't have anything but ast for variable here.
           assert(x.uBody.eType == E_VAR)
-          var lookupRes = lookupVar(x.uBody.vName, layerCount, env)
+          var lookupRes = lookupVar(x.uBody.vName, env)
           if lookupRes.isNone():
             x.raiseErrorWithReason(&"Variable {x.uBody.vName} is not defined.")
-          res.add((REF, lookupRes.get()[0], lookupRes.get()[1]))
+            res.add((REF, lookupRes.get()))
+          else:
+            res &= x.uBody.compileExpr(env)
+            case x.uOp:
+              of "-":
+                res.add((OPR, 1))
+              of "valof":
+                res.add((DEREF, 0))
+              else:
+                discard  # cannot happen.
         else:
-          res &= x.uBody.compileExpr(layerCount, env)
+          res &= x.uBody.compileExpr(env)
           case x.uOp:
             of "-":
-              res.add((OPR, 0, 1))
+              res.add((OPR, 1))
             of "valof":
-              res.add((DEREF, 0, 0))
+              res.add((DEREF, 0))
             else:
               discard  # cannot happen.
-    of E_LIT:
-      res.add((LIT, 0, x.lVal))
-    of E_VAR:
-      var lookupRes = lookupVar(x.vName, layerCount, env)
-      if lookupRes.isSome():
-        res.add((LOD, lookupRes.get()[0], lookupRes.get()[1]))
-      else:
-        let constLookupRes = lookupConst(x.vName, env)
-        if constLookupRes.isSome():
-          res.add((LIT, 0, constLookupRes.get()))
-        else:
-          x.raiseErrorWithReason(&"Cannot find the definition of {x.vName}")
+      of E_LIT:
+        res.add((LIT, x.lVal))
+      of E_VAR:
+        var lookupRes = lookupVar(x.vName, env)
+        if lookupRes.isSome():
+          res.add((LOD, lookupRes.get()))
+          break dispatch
+        lookupRes = lookupGlobal(x.vName, env)
+        if lookupRes.isSome():
+          res.add((LODA, lookupRes.get()))
+          break dispatch
+        lookupRes = lookupConst(x.vName, env)
+        if lookupRes.isSome():
+          res.add((LIT, lookupRes.get()))
+          break dispatch
+        x.raiseErrorWithReason(&"Cannot find the definition of {x.vName}")
+  echo "res ", x, res
   return res
 
-proc compileCond(x: Cond, layerCount: int, env: Env): seq[Instr] =
+proc compileCond(x: Cond, env: Env): seq[Instr] =
   var res: seq[Instr] = @[]
   case x.cType:
     of C_EXPR_PRED:
-      res &= x.pBody.compileExpr(layerCount, env)
+      res &= x.pBody.compileExpr(env)
       let opNum = case x.predName:
                     of "odd": 6
                     else: -1
-      res.add((OPR, 0, opNum))
+      res.add((OPR, opNum))
     of C_EXPR_REL:
-      res &= x.relLhs.compileExpr(layerCount, env)
-      res &= x.relRhs.compileExpr(layerCount, env)
+      res &= x.relLhs.compileExpr(env)
+      res &= x.relRhs.compileExpr(env)
       let opNum = case x.relOp:
                     of "=": 8
                     of "#": 9
@@ -188,7 +171,7 @@ proc compileCond(x: Cond, layerCount: int, env: Env): seq[Instr] =
                     of "<": 10
                     of ">": 12
                     else: -1  # cannot happen
-      res.add((OPR, 0, opNum))
+      res.add((OPR, opNum))
   return res
 
 # Now this gets slightly tricky. The branching instruction in the vm of the original
@@ -247,95 +230,110 @@ proc compileCond(x: Cond, layerCount: int, env: Env): seq[Instr] =
 # the `seq[(int, int, string)]` part is for returning the location of such
 # instructions and the name of the called procedures. The second `int` part is
 # to maintain the proper layer count; this will become relevant in later parts.
-proc compileStatementList(x: seq[Statement], currentLoc: int, layerCount: int, env: Env): (seq[Instr], seq[(int, int, string)])
-proc compileStatement(x: Statement, currentLoc: int, layerCount: int, env: Env): (seq[Instr], seq[(int, int, string)]) =
+proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[Instr], seq[(int, int, string)])
+proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq[(int, int, string)]) =
   var res: seq[Instr] = @[]
   var callFillers: seq[(int, int, string)] = @[]
   case x.sType:
     of S_ASSIGN:
-      case x.aTarget.lvType:
-        of LV_VAR:
-          let resolveRes = lookupVar(x.aTarget.vName, layerCount, env)
-          if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.aTarget.vName} not found.")
-          res &= x.aVal.compileExpr(layerCount, env)
-          res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
-        of LV_DEREF:
-          res &= x.aVal.compileExpr(layerCount, env)
-          var lhsRes = x.aTarget.drBody.compileExpr(layerCount, env)
-          # NOTE: this is a little complicated to explain. Consider the lhs `A[]`,
-          # we would expect the value of `A` to be on top of the stack; with the
-          # lhs `A[][]`, this value should be `valof A`; with lhs `A[][][]`, this
-          # value should be `valof valof A`; etc.. A way to reuse currently-existing
-          # code is to treat `[]` as `valof`, compile the whole thing as an expr,
-          # and remove the last `valof` operation (which compiles to a single
-          # `DEREF` instruction.
-          assert(lhsRes[^1][0] == DEREF)
-          discard lhsRes.pop()
-          res &= lhsRes
-          res.add((POPA, 0, 0))
-          res.add((POPR, 0, 0))
+      block dispatch:
+        case x.aTarget.lvType:
+          of LV_VAR:
+            var resolveRes = lookupVar(x.aTarget.vName, env)
+            if resolveRes.isSome():
+              res &= x.aVal.compileExpr(env)
+              res.add((STO, resolveRes.get()))
+              break dispatch
+            resolveRes = lookupGlobal(x.aTarget.vName, env)
+            if resolveRes.isSome():
+              res &= x.aVal.compileExpr(env)
+              res.add((STOA, resolveRes.get()))
+              break dispatch
+            x.raiseErrorWithReason(&"Variable name {x.aTarget.vName} not found.")
+          of LV_DEREF:
+            res &= x.aVal.compileExpr(env)
+            var lhsRes = x.aTarget.drBody.compileExpr(env)
+            # NOTE: this is a little complicated to explain. Consider the lhs `A[]`,
+            # we would expect the value of `A` to be on top of the stack; with the
+            # lhs `A[][]`, this value should be `valof A`; with lhs `A[][][]`, this
+            # value should be `valof valof A`; etc.. A way to reuse currently-existing
+            # code is to treat `[]` as `valof`, compile the whole thing as an expr,
+            # and remove the last `valof` operation (which compiles to a single
+            # `DEREF` instruction.
+            assert(lhsRes[^1][0] == DEREF)
+            discard lhsRes.pop()
+            res &= lhsRes
+            res.add((POPA, 0))
+            res.add((POPR, 0))
     of S_BLOCK:
-      let s = compileStatementList(x.body, currentLoc, layerCount, env)
+      let s = compileStatementList(x.body, currentLoc, env)
       res &= s[0]
       callFillers &= s[1]
     of S_IF:
-      let condPart: seq[Instr] = compileCond(x.ifCond, layerCount, env)
+      let condPart: seq[Instr] = compileCond(x.ifCond, env)
       res &= condPart
       # the `+1` is for the JPC instr itself; it's the same case for S_WHILE.
-      let bodyPart = compileStatement(x.ifThen, currentLoc + condPart.len + 1, layerCount, env)
+      let bodyPart = compileStatement(x.ifThen, currentLoc + condPart.len + 1, env)
       let bodyInstr = bodyPart[0]
       let bodyCallFillers = bodyPart[1]
-      res.add((JPC, 0, currentLoc + condPart.len() + 1 + bodyInstr.len()))
+      res.add((JPC, currentLoc + condPart.len() + 1 + bodyInstr.len()))
       res &= bodyInstr
       callFillers &= bodyCallFillers
     of S_WHILE:
       let l1 = currentLoc
-      let condPart = compileCond(x.wCond, layerCount, env)
+      let condPart = compileCond(x.wCond, env)
       res &= condPart
-      let bodyPart = compileStatement(x.wBody, currentLoc + condPart.len + 1, layerCount, env)
+      let bodyPart = compileStatement(x.wBody, currentLoc + condPart.len + 1, env)
       # the last `+1` part is for the JMP instruction used to jump back to L1.
-      res.add((JPC, 0, currentLoc + condPart.len + 1 + bodyPart[0].len + 1))
+      res.add((JPC, currentLoc + condPart.len + 1 + bodyPart[0].len + 1))
       res &= bodyPart[0]
-      res.add((JMP, 0, l1))
+      res.add((JMP, l1))
       callFillers &= bodyPart[1]
     of S_INPUT:
-      res.add((OPR, 0, 7))
-      case x.iTarget.lvType:
-        of LV_VAR:
-          let resolveRes = lookupVar(x.iTarget.vName, layerCount, env)
-          if resolveRes.isNone(): x.raiseErrorWithReason(&"Variable name {x.iTarget.vName} not found")
-          res.add((STO, resolveRes.get()[0], resolveRes.get()[1]))
-        of LV_DEREF:
-          var lhsRes = x.iTarget.drBody.compileExpr(layerCount, env)
-          assert(lhsRes[^1][0] == DEREF)
-          discard lhsRes.pop()
-          res &= lhsRes
-          res.add((POPA, 0, 0))
-          res.add((POPR, 0, 0))
+      res.add((OPR, 7))
+      block dispatch:
+        case x.iTarget.lvType:
+          of LV_VAR:
+            var resolveRes = lookupVar(x.iTarget.vName, env)
+            if resolveRes.isSome():
+              res.add((STO, resolveRes.get()))
+              break dispatch
+            resolveRes = lookupGlobal(x.iTarget.vName, env)
+            if resolveRes.isSome():
+              res.add((STOA, resolveRes.get()))
+              break dispatch
+            x.raiseErrorWithReason(&"Variable name {x.iTarget.vName} not found")
+          of LV_DEREF:
+            var lhsRes = x.iTarget.drBody.compileExpr(env)
+            assert(lhsRes[^1][0] == DEREF)
+            discard lhsRes.pop()
+            res &= lhsRes
+            res.add((POPA, 0))
+            res.add((POPR, 0))
     of S_PRINT:
-      res &= compileExpr(x.pExpr, layerCount, env)
-      res.add((OPR, 0, 14))
+      res &= compileExpr(x.pExpr, env)
+      res.add((OPR, 14))
     of S_RETURN:
-      res &= compileExpr(x.rExpr, layerCount, env)
-      res.add((POPA, 0, 0))
-      res.add((OPR, 0, 0))
+      res &= compileExpr(x.rExpr, env)
+      res.add((POPA, 0))
+      res.add((OPR, 0))
     of S_CALL:
-      let lookupRes = env.lookupProc(x.cTarget, layerCount)
+      let lookupRes = env.lookupProc(x.cTarget)
       if lookupRes.isSome():
         if lookupRes.get.arity != x.cArgs.len:
           x.raiseErrorWithReason("Arity mismatch.")
       var cnt = currentLoc
       if x.cArgs.len > 0:
         for a in x.cArgs:
-          let argRes = compileExpr(a, layerCount, env)
+          let argRes = compileExpr(a, env)
           res &= argRes
           cnt += argRes.len
       # inserting placeholder call instr.
-      res.add((CAL, 0, 0))
+      res.add((CAL, 0))
       callFillers.add((cnt, 0, x.cTarget))
       if x.cArgs.len > 0:
         for a in x.cArgs:
-          res.add((POP, 0, 0))
+          res.add((POP, 0))
       # NOTE: PUSHA is not added since CALL statement does not use the return value.
       # TODO: we handle argument passing later.
       # NOTE: the info is only used for arity check because we don't know the
@@ -343,12 +341,12 @@ proc compileStatement(x: Statement, currentLoc: int, layerCount: int, env: Env):
       # signature before actually compiling them.
   return (res, callFillers)
 
-proc compileStatementList(x: seq[Statement], currentLoc: int, layerCount: int, env: Env): (seq[Instr], seq[(int, int, string)]) =
+proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[Instr], seq[(int, int, string)]) =
   var res: seq[Instr] = @[]
   var callFillers: seq[(int, int, string)] = @[]
   var cnt = currentLoc
   for stmt in x:
-    let stmtRes = stmt.compileStatement(cnt, layerCount, env)
+    let stmtRes = stmt.compileStatement(cnt, env)
     res &= stmtRes[0]
     callFillers &= stmtRes[1]
     cnt += stmtRes[0].len()
@@ -444,44 +442,82 @@ proc compileStatementList(x: seq[Statement], currentLoc: int, layerCount: int, e
 # environment to enable recursion. The name of the proc, when resolving, has
 # a depth of 1 (instead of 0 like calling local procedures) since technically
 # lives in the parent scope.
-proc compileBlock(x: Block, currentLoc: int, layerCount: int, env: var Env, argTable: TableRef[string, (int, int)]): (seq[Instr], seq[(int, int, string)])
-proc compileProcDef(x: ProcDef, currentLoc: int, layerCount: int, env: var Env): (seq[Instr], seq[(int, int, string)]) =
-  let argTable = x.assignParams(layerCount)
-  let res = x.body.compileBlock(currentLoc, layerCount, env, argTable)
+proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[string, int]): (seq[Instr], seq[(int, int, string)])
+proc compileProcDef(x: ProcDef, currentLoc: int, env: var Env): (seq[Instr], seq[(int, int, string)]) =
+  let argTable = x.assignParams()
+  let res = x.body.compileBlock(currentLoc, env, argTable)
   var resInstrList = res[0]
   var newCallFillers: seq[(int, int, string)] = @[]
   for c in res[1]:
     let calLoc = c[0]
     let calName = c[2]
     if calName == x.name:
-      resInstrList[calLoc-currentLoc] = (CAL, 1, currentLoc)
+      resInstrList[calLoc-currentLoc] = (CAL, currentLoc)
     else:
       newCallFillers.add((c[0], c[1]+1, c[2]))
-  resInstrList.add((OPR, 0, 0))
+  resInstrList.add((OPR, 0))
   return (resInstrList, newCallFillers)
 
-proc compileBlock(x: Block, currentLoc: int, layerCount: int, env: var Env, argTable: TableRef[string, (int, int)]): (seq[Instr], seq[(int, int, string)]) =
+proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[string, int]): (seq[Instr], seq[(int, int, string)]) =
   # echo "compiling ", name, " at loc ", currentLoc, " at layer ", layerCount
   var blockBase = currentLoc
-  let constTable = if x.constDef.len <= 0: nil else: x.collectConst
+  let constTable = if x.constDef.len <= 0: nil else: x.constDef.collectConst
   var res: seq[Instr] = @[]
   var callFillers: seq[(int, int, string)] = @[]
   var procTable: TableRef[string, tuple[loc: int, arity: int]] = newTable[string, tuple[loc: int, arity: int]]()
-  var varTable: TableRef[string, (int, int)] = nil
+  var varTable: TableRef[string, int] = nil
   if x.varDef.len > 0:
-    res.add((INT, 0, x.varDef.len))
-    varTable = x.allocVar(layerCount)
+    res.add((INT, x.varDef.len))
+    varTable = x.varDef.allocVar()
     blockBase += 1
+  var globalTable: TableRef[string, int] = nil
   let newEnvFrame = (constTable: constTable,
+                     globalTable: globalTable,
                      varTable: varTable,
                      procTable: procTable,
                      argTable: argTable)
   env.add(newEnvFrame)
 
+  let bodyRes = x.body.compileStatement(blockBase, env)
+  discard env.pop()
+  res &= bodyRes[0]
+  let bodyCallFillers = bodyRes[1]
+  for c in bodyCallFillers:
+    let calLoc = c[0]
+    let calName = c[2]
+    if procTable.hasKey(calName):
+      res[calLoc-currentLoc] = (CAL, procTable[calName].loc)
+    else:
+      callFillers.add((c[0], c[1], c[2]))
+  return (res, callFillers)
+proc compileBlock(x: Block, currentLoc: int, env: var Env): (seq[Instr], seq[(int, int, string)]) =
+  compileBlock(x, currentLoc, env, nil)
+
+proc compileProgram*(x: Program): seq[Instr] =
+  # echo "compiling ", name, " at loc ", currentLoc, " at layer ", layerCount
+  var blockBase = 0
+  let constTable = if x.constDef.len <= 0: nil else: x.constDef.collectConst
+  var res: seq[Instr] = @[]
+  var callFillers: seq[(int, int, string)] = @[]
+  var procTable: TableRef[string, tuple[loc: int, arity: int]] = newTable[string, tuple[loc: int, arity: int]]()
+  var varTable: TableRef[string, int] = nil
+  var globalTable: TableRef[string, int] = nil
+  if x.varDef.len > 0:
+    res.add((INT, x.varDef.len))
+    globalTable = x.varDef.allocVar()
+    blockBase += 1
+  var argTable: TableRef[string, int] = nil
+  let newEnvFrame = (constTable: constTable,
+                     globalTable: globalTable,
+                     varTable: varTable,
+                     procTable: procTable,
+                     argTable: argTable)
+  var env = @[newEnvFrame]
+
   if x.procDef.len > 0:
     # NOTE: we can resolve this locally because we can calculate the sizes of
     # local procedures locally. This is a placeholder that we'll resolve later.
-    res.add((JMP, 0, 0))
+    res.add((JMP, 0))
     blockBase += 1
     var procLocationCount = blockBase
     # NOTE: here we collect arity information & use it to check CALL statements;
@@ -491,8 +527,9 @@ proc compileBlock(x: Block, currentLoc: int, layerCount: int, env: var Env, argT
     # it's only some dummy value for now.
     for p in x.procDef:
       procTable[p.name] = (loc: procLocationCount, arity: p.paramList.len)
+    let layerCount = 0
     for p in x.procDef:
-      let pRes = p.compileProcDef(procLocationCount, layerCount+1, env)
+      let pRes = p.compileProcDef(procLocationCount, env)
       # NOTE: we need to update procTable again because the last time we update
       # this we updated it with dummy values; this time we need to insert all
       # the correct values.
@@ -507,15 +544,15 @@ proc compileBlock(x: Block, currentLoc: int, layerCount: int, env: var Env, argT
       let calLoc = c[0]
       let calName = c[2]
       if procTable.hasKey(calName):
-        res[calLoc-currentLoc] = (CAL, c[1], procTable[calName].loc)
+        res[calLoc] = (CAL, procTable[calName].loc)
       else:
-        newCallFillers.add((c[0], c[1]+1, c[2]))
+        newCallFillers.add((c[0], c[1], c[2]))
     callFillers = newCallFillers
     # resolving the JMP we setup in the beginning...
-    res[blockBase-1-currentLoc] = (JMP, 0, procLocationCount)
+    res[blockBase-1] = (JMP, procLocationCount)
     blockBase = procLocationCount
 
-  let bodyRes = x.body.compileStatement(blockBase, layerCount, env)
+  let bodyRes = x.body.compileStatement(blockBase, env)
   discard env.pop()
   res &= bodyRes[0]
   let bodyCallFillers = bodyRes[1]
@@ -523,17 +560,10 @@ proc compileBlock(x: Block, currentLoc: int, layerCount: int, env: var Env, argT
     let calLoc = c[0]
     let calName = c[2]
     if procTable.hasKey(calName):
-      res[calLoc-currentLoc] = (CAL, c[1], procTable[calName].loc)
+      res[calLoc] = (CAL, procTable[calName].loc)
     else:
       callFillers.add((c[0], c[1]+1, c[2]))
-  return (res, callFillers)
-proc compileBlock(x: Block, currentLoc: int, layerCount: int, env: var Env): (seq[Instr], seq[(int, int, string)]) =
-  compileBlock(x, currentLoc, layerCount, env, nil)
 
-proc compileProgram*(x: Program): seq[Instr] =
-  var env: Env = @[]
-  let transformRes = x.transform
-  let res = transformRes.body.compileBlock(0, 0, env)
-  assert(res[1].len <= 0)
-  return res[0]
+  assert callfillers.len <= 0
+  return res
   

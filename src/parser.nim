@@ -2,6 +2,8 @@ import std/options
 from std/strformat import `&`
 from std/strutils import parseInt
 import ast
+import prettyprint
+from std/sequtils import foldr
 
 type
   ParserState = ref object
@@ -11,11 +13,11 @@ type
     stp: int
 
 let reservedWords: seq[string] = @[
-  "if", "then", "while", "do", "begin", "end", "procedure", "const", "var", "input", "print", "return", "valof", "ref"
+  "if", "then", "while", "do", "begin", "end", "procedure", "const", "var", "input", "print", "return", "valof", "ref", "elif", "else"
 ]
 
 proc raiseErrorWithReason(x: ParserState, reason: string): void =
-  raise newException(ValueError, &"[Parser] ({x.line},{x.col}) {reason}")
+  raise newException(ValueError, &"[Parser] ({x.line+1},{x.col+1}) {reason}")
 
 proc ended(x: ParserState): bool {.inline.} =
   x.stp >= x.x.len
@@ -177,18 +179,25 @@ proc parseFactor(x: ParserState): Option[Expr] =
   return some(subj)
 
 proc parseTerm(x: ParserState): Option[Expr] =
+  discard x.skipWhite
+  let line = x.line
+  let col = x.col
   var res = x.skipWhite.parseFactor
   if res.isNone(): return none(Expr)
   while true:
     var thisOp = x.skipWhite.expect("*")
     if thisOp.isNone(): thisOp = x.skipWhite.expect("/")
+    if thisOp.isNone(): thisOp = x.skipWhite.expect("%")
     if thisOp.isNone(): return res
     var rhs = x.skipWhite.parseFactor
     if rhs.isNone(): x.raiseErrorWithReason("Term expected.")
-    res = some(Expr(line: x.line, col: x.col, eType: E_BINOP, binop: thisOp.get(), bLhs: res.get(), bRhs: rhs.get()))
+    res = some(Expr(line: line, col: col, eType: E_BINOP, binop: thisOp.get(), bLhs: res.get(), bRhs: rhs.get()))
     continue
 
 proc parseExpr(x: ParserState): Option[Expr] =
+  discard x.skipWhite
+  let line = x.line
+  let col = x.col
   var prefixUnaryOp = x.skipWhite.expect("+")
   if prefixUnaryOp.isNone(): prefixUnaryOp = x.skipWhite.expect("-")
   var res = x.skipWhite.parseTerm
@@ -196,22 +205,42 @@ proc parseExpr(x: ParserState): Option[Expr] =
     if prefixUnaryOp.isNone(): return none(Expr)
     else: x.raiseErrorWithReason("Term expected.")
   if prefixUnaryOp.isSome():
-    res = some(Expr(line: x.line, col: x.col, eType: E_UNARYOP, uOp: prefixUnaryOp.get(), uBody: res.get()))
+    res = some(Expr(line: line, col: col, eType: E_UNARYOP, uOp: prefixUnaryOp.get(), uBody: res.get()))
   while true:
     var thisOp = x.skipWhite.expect("+")
     if thisOp.isNone(): thisOp = x.skipWhite.expect("-")
     if thisOp.isNone(): return res
     var rhs = x.skipWhite.parseTerm
     if rhs.isNone(): x.raiseErrorWithReason("Term expected.")
-    res = some(Expr(line: x.line, col: x.col, eType: E_BINOP, binop: thisOp.get(), bLhs: res.get(), bRhs: rhs.get()))
+    res = some(Expr(line: line, col: col, eType: E_BINOP, binop: thisOp.get(), bLhs: res.get(), bRhs: rhs.get()))
     continue
 
-proc parseCond(x: ParserState): Option[Cond] =
+# Cond ::= Cond1 {"or" Cond1}
+# Cond1 ::= Cond2 {"and" Cond2}
+# Cond2 ::= "odd" Expr
+#         | Expr ("="|"!="|"<="|"<"|">="|">") Expr
+#         | "not" Cond
+#         | "(" Cond ")"
+proc parseCond(x: ParserState): Option[Cond]
+proc parseCond2(x: ParserState): Option[Cond] =
+  var line = x.line
+  var col = x.col
   var shouldBePred = x.skipWhite.expect("odd")
   if shouldBePred.isSome():
     var body = x.skipWhite.parseExpr
     if body.isNone(): x.raiseErrorWithReason("Expression expected.")
-    return some(Cond(line: x.line, col: x.col, cType: C_EXPR_PRED, predName: shouldBePred.get(), pBody: body.get()))
+    return some(Cond(line: line, col: col, cType: C_EXPR_PRED, predName: shouldBePred.get(), pBody: body.get()))
+  let shouldBeNot = x.skipWhite.expect("not")
+  if shouldBeNot.isSome():
+    var body = x.skipWhite.parseCond
+    if body.isNone(): x.raiseErrorWithReason("Condition expected.")
+    return some(Cond(line: line, col: col, cType: C_EXPR_NOT, nBody: body.get))
+  let leftParen = x.skipWhite.expect("(")
+  if leftParen.isSome():
+    var body = x.skipWhite.parseCond
+    if body.isNone(): x.raiseErrorWithReason("Condition expected.")
+    if x.skipWhite.expect(")").isNone(): x.raiseErrorWithReason("Right parenthesis expected.")
+    return body
   var lhs = x.skipWhite.parseExpr
   if lhs.isNone(): return none(Cond)
   var thisOp = x.skipWhite.expect("=")
@@ -223,9 +252,46 @@ proc parseCond(x: ParserState): Option[Cond] =
   if thisOp.isNone(): x.raiseErrorWithReason("Expression expected.")
   var rhs = x.skipWhite.parseExpr
   if rhs.isNone(): x.raiseErrorWithReason("Expression expected.")
-  return some(Cond(line: x.line, col: x.col, cType: C_EXPR_REL, relOp: thisOp.get(), relLhs: lhs.get(), relRhs: rhs.get()))
-
+  return some(Cond(line: line, col: col, cType: C_EXPR_REL, relOp: thisOp.get(), relLhs: lhs.get(), relRhs: rhs.get()))
+proc parseCond1(x: ParserState): Option[Cond] =
+  let line = x.line
+  let col = x.col
+  let lhs = x.skipWhite.parseCond2
+  if lhs.isNone(): return none(Cond)
+  if not x.skipWhite.peek("and"): return lhs
+  var subjList: seq[Cond] = @[lhs.get]
+  while x.skipWhite.peek("and"):
+    discard x.skipWhite.expect("and")
+    let next = x.skipWhite.parseCond2
+    if next.isNone(): x.raiseErrorWithReason("Condition expected.")
+    subjList.add(next.get())
+  return some(foldr(subjList, Cond(line: a.line, col: a.col,
+                                   cType: C_EXPR_BINOP,
+                                   binOp: "and",
+                                   binLhs: a,
+                                   binRhs: b)))
+proc parseCond(x: ParserState): Option[Cond] =
+  let line = x.line
+  let col = x.col
+  let lhs = x.skipWhite.parseCond1
+  if lhs.isNone(): return none(Cond)
+  if not x.skipWhite.peek("or"): return lhs
+  var subjList: seq[Cond] = @[lhs.get]
+  while x.skipWhite.peek("or"):
+    discard x.skipWhite.expect("or")
+    let next = x.skipWhite.parseCond1
+    if next.isNone(): x.raiseErrorWithReason("Condition expected.")
+    subjList.add(next.get())
+  return some(foldr(subjList, Cond(line: a.line, col: a.col,
+                                   cType: C_EXPR_BINOP,
+                                   binOp: "or",
+                                   binLhs: a,
+                                   binRhs: b)))
+  
 proc parseLValue(x: ParserState): Option[LValue] =
+  discard x.skipWhite
+  let line = x.line
+  let col = x.col
   var possibleDereferrencedTarget = x.skipWhite.parseExpr()
   if possibleDereferrencedTarget.isNone(): return none(LValue)
   if x.peek("[]"):
@@ -237,15 +303,18 @@ proc parseLValue(x: ParserState): Option[LValue] =
     var subj = possibleDereferrencedTarget.get()
     var i = 0
     while i < derefCount:
-      subj = Expr(line: x.line, col: x.col, eType: E_UNARYOP, uOp: "valof", uBody: subj)
+      subj = Expr(line: line, col: col, eType: E_UNARYOP, uOp: "valof", uBody: subj)
       i += 1
-    return some(LValue(line: x.line, col: x.col, lvType: LV_DEREF, drBody: subj))
+    return some(LValue(line: line, col: col, lvType: LV_DEREF, drBody: subj))
   else:
     assert(possibleDereferrencedTarget.get().eType == E_VAR)
     var name = possibleDereferrencedTarget.get().vName
-    return some(LValue(line: x.line, col: x.col, lvType: LV_VAR, vName: name))
+    return some(LValue(line: line, col: col, lvType: LV_VAR, vName: name))
 
 proc parseStatement(x: ParserState): Option[Statement] =
+  discard x.skipWhite
+  let line = x.line
+  let col = x.col
   if x.skipWhite.peek("call"):
     discard x.skipWhite.expect("call")
     var target = x.skipWhite.takeIdent()
@@ -266,17 +335,24 @@ proc parseStatement(x: ParserState): Option[Statement] =
           if nextExpr.isNone(): x.raiseErrorWithReason("Expression expected.")
           argList.add(nextExpr.get())
         if x.skipWhite.expect(")").isNone(): x.raiseErrorWithReason("Right parenthesis expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_CALL, cTarget: target.get(), cArgs: argList))
+    return some(Statement(line: line, col: col, sType: S_CALL, cTarget: target.get(), cArgs: argList))
   if x.skipWhite.peek("input"):
     discard x.skipWhite.expect("input")
     var target = x.skipWhite.parseLValue()
     if target.isNone(): x.raiseErrorWithReason("Proper lvalue expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_INPUT, iTarget: target.get()))
+    return some(Statement(line: line, col: col, sType: S_INPUT, iTarget: target.get()))
   if x.skipWhite.peek("print"):
     discard x.skipWhite.expect("print")
+    var exprList: seq[Expr] = @[]
     var target = x.skipWhite.parseExpr()
     if target.isNone(): x.raiseErrorWithReason("Expression expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_PRINT, pExpr: target.get()))
+    exprList.add(target.get)
+    while x.skipWhite.peek(","):
+      discard x.skipWhite.expect(",")
+      var target = x.skipWhite.parseExpr()
+      if target.isNone(): break
+      exprList.add(target.get)
+    return some(Statement(line: line, col: col, sType: S_PRINT, pExpr: exprList))
   if x.skipWhite.peek("begin"):
     discard x.skipWhite.expect("begin")
     var body: seq[Statement] = @[]
@@ -293,7 +369,7 @@ proc parseStatement(x: ParserState): Option[Statement] =
       if nextStatement.isNone(): x.raiseErrorWithReason("Statement expected.")
       body.add(nextStatement.get())
     if x.skipWhite.expect("end").isNone(): x.raiseErrorWithReason("\"end\" expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_BLOCK, body: body))
+    return some(Statement(line: line, col: col, sType: S_BLOCK, body: body))
   if x.skipWhite.peek("if"):
     discard x.skipWhite.expect("if")
     var cond = x.skipWhite.parseCond
@@ -301,7 +377,28 @@ proc parseStatement(x: ParserState): Option[Statement] =
     if x.skipWhite.expect("then").isNone(): x.raiseErrorWithReason("\"then\" expected.")
     var body = x.skipWhite.parseStatement
     if body.isNone(): x.raiseErrorWithReason("Statement expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_IF, ifCond: cond.get(), ifThen: body.get()))
+    var branchList: seq[(Cond, Statement)] = @[(cond.get, body.get)]
+    var elseBranch: Statement = nil
+    while true:
+      if x.skipWhite.peek("elif"):
+        discard x.skipWhite.expect("elif")
+        cond = x.skipWhite.parseCond
+        if cond.isNone(): x.raiseErrorWithReason("Condition expected.")
+        if x.skipWhite.expect("then").isNone(): x.raiseErrorWithReason("\"then\" expected.")
+        body = x.skipWhite.parseStatement
+        if body.isNone(): x.raiseErrorWithReason("Statement expected.")
+        branchList.add((cond.get, body.get))
+      elif x.skipWhite.peek("else"):
+        discard x.skipWhite.expect("else")
+        body = x.skipWhite.parseStatement
+        if body.isNone(): x.raiseErrorWithReason("Statement expected.")
+        elseBranch = body.get
+        break
+      else:
+        break
+    return some(Statement(line: line, col: col, sType: S_IF,
+                          branchList: branchList,
+                          elseBranch: elseBranch))
   if x.skipWhite.peek("while"):
     discard x.skipWhite.expect("while")
     var cond = x.skipWhite.parseCond
@@ -309,18 +406,18 @@ proc parseStatement(x: ParserState): Option[Statement] =
     if x.skipWhite.expect("do").isNone(): x.raiseErrorWithReason("\"do\" expected.")
     var body = x.skipWhite.parseStatement
     if body.isNone(): x.raiseErrorWithReason("Statement expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_WHILE, wCond: cond.get(), wBody: body.get()))
+    return some(Statement(line: line, col: col, sType: S_WHILE, wCond: cond.get(), wBody: body.get()))
   if x.skipWhite.peek("return"):
     discard x.skipWhite.expect("return")
     var expr = x.skipWhite.parseExpr
     if expr.isNone(): x.raiseErrorWithReason("Expression expected.")
-    return some(Statement(line: x.line, col: x.col, sType: S_RETURN, rExpr: expr.get()))
+    return some(Statement(line: line, col: col, sType: S_RETURN, rExpr: expr.get()))
   var ident = x.skipWhite.parseLValue()
   if ident.isNone(): x.raiseErrorWithReason("Proper lvalue (or any of the statement keyword) expected.")
   if x.skipWhite.expect(":=").isNone(): x.raiseErrorWithReason("\":=\" expected.")
   var rhs = x.skipWhite.parseExpr
   if rhs.isNone(): x.raiseErrorWithReason("Expression expected.")
-  return some(Statement(line: x.line, col: x.col, sType: S_ASSIGN, aTarget: ident.get(), aVal: rhs.get()))
+  return some(Statement(line: line, col: col, sType: S_ASSIGN, aTarget: ident.get(), aVal: rhs.get()))
 
 proc parseConstClause(x: ParserState): Option[seq[(string, int)]] =
   if x.expect("const").isNone(): return none(seq[(string, int)])
@@ -358,6 +455,9 @@ proc parseBlock(x: ParserState): Option[Block]
 proc parseProcClause(x: ParserState): Option[seq[ProcDef]] =
   var res: seq[ProcDef] = @[]
   while true:
+    discard x.skipWhite
+    let line = x.line
+    let col = x.col
     if x.skipWhite.expect("procedure").isNone(): break
     var ident = x.skipWhite.takeIdent
     if ident.isNone(): x.raiseErrorWithReason("Identifier expected.")
@@ -383,15 +483,18 @@ proc parseProcClause(x: ParserState): Option[seq[ProcDef]] =
     if x.skipWhite.expect(";").isNone(): x.raiseErrorWithReason("\";\" expected.")
     for v in blockRes.get().varDef:
       if v in paramList: x.raiseErrorWithReason("Variable {v} is already defined as parameter.")
-    res.add(ProcDef(name: ident.get(), paramList: paramList, body: blockRes.get()))
+    res.add(ProcDef(line: line, col: col, name: ident.get(), paramList: paramList, body: blockRes.get()))
   return some(res)
   
 proc parseBlock(x: ParserState): Option[Block] =
+  discard x.skipWhite
+  let line = x.line
+  let col = x.col
   var constClause = x.skipWhite.parseConstClause
   var varClause = x.skipWhite.parseVarClause
   var body = x.skipWhite.parseStatement
   if body.isNone(): x.raiseErrorWithReason("Statement expected.")
-  return some(Block(line: x.line, col: x.col,
+  return some(Block(line: line, col: col,
                     constDef: if constClause.isNone(): @[] else: constClause.get(),
                     varDef: if varClause.isNone(): @[] else: varClause.get(),
                     body: body.get()))

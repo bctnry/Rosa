@@ -1,0 +1,24 @@
+var z;
+
+procedure fizzbuzz(n);
+  var x;
+begin
+    x := 1;
+    while x < n do begin
+        if x % 3 = 0 and x % 5 = 0 then
+            print 1999
+        elif x % 3 = 0 then
+            print 2999
+        elif x % 5 = 0 then
+            print 3999
+        else
+            print x
+        x := x + 1
+    end;
+end;
+
+begin
+    input z;
+    call fizzbuzz(z);
+end.
+        

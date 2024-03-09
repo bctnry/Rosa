@@ -1,3 +1,4 @@
+from std/options import Option
 from std/strformat import `&`
 
 type
@@ -24,6 +25,8 @@ type
   CondType* = enum
     C_EXPR_PRED
     C_EXPR_REL
+    C_EXPR_NOT
+    C_EXPR_BINOP
   Cond* = ref object
     line*: int
     col*: int
@@ -35,6 +38,12 @@ type
       relOp*: string
       relLhs*: Expr
       relRhs*: Expr
+    of C_EXPR_NOT:
+      nBody*: Cond
+    of C_EXPR_BINOP:
+      binOp*: string
+      binLhs*: Cond
+      binRhs*: Cond
   LValueType* = enum
     LV_VAR
     LV_DEREF
@@ -68,18 +77,20 @@ type
     of S_INPUT:
       iTarget*: LValue
     of S_PRINT:
-      pExpr*: Expr
+      pExpr*: seq[Expr]
     of S_BLOCK:
       body*: seq[Statement]
     of S_IF:
-      ifCond*: Cond
-      ifThen*: Statement
+      branchList*: seq[(Cond, Statement)]
+      elseBranch*: Statement
     of S_WHILE:
       wCond*: Cond
       wBody*: Statement
     of S_RETURN:
       rExpr*: Expr
   ProcDef* = ref object
+    line*: int
+    col*: int
     name*: string
     paramList*: seq[string]
     body*: Block

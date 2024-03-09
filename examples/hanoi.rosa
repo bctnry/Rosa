@@ -1,15 +1,11 @@
 procedure hanoi(n,from,to,via);
 begin
     if n = 1 then begin
-        print from;
-        print to;
-        print -1;
+        print from, to, -1;
     end;
     if n > 1 then begin
         call hanoi(n-1, from, via, to);
-        print from;
-        print to;
-        print -1;
+        print from, to, -1;
         call hanoi(n-1, via, to, from);
     end;
 end;

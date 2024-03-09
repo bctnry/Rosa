@@ -19,6 +19,10 @@ type
     POPR
     LODA
     STOA
+    RET
+    AND
+    OR
+    NOT
   Instr* = (InstrType, int)
 
 proc `$`*(x: InstrType): string =
@@ -39,15 +43,20 @@ proc `$`*(x: InstrType): string =
     of POPR: "POPR"
     of LODA: "LODA"
     of STOA: "STOA"
+    of RET: "RET"
+    of AND: "AND"
+    of OR: "OR"
+    of NOT: "NOT"
 
+# NOTE: assumes all integers are 2 bytes long and little endian.
 type
   VM* = ref object
-    pc*: int
-    base*: int
-    stk*: int
-    stkmem*: array[2048,int]
+    pc*: int16
+    base*: int16
+    stk*: int16
+    stkmem*: array[8192,int16]
     program*: seq[Instr]
-    a*: int
+    a*: int16
 
 proc loadVM*(program: seq[Instr]): VM =
   VM(pc: 0,
@@ -55,13 +64,13 @@ proc loadVM*(program: seq[Instr]): VM =
      stk: 0,
      program: program,
      a: 0)
-    
+
 proc runVM*(vm: VM): void =
     
   while vm.pc < vm.program.len:
     let i = vm.program[vm.pc]
     let iType = i[0]
-    let iArg = i[1]
+    let iArg = i[1].int16
     case iType:
       of LIT:
         vm.stk += 1
@@ -69,13 +78,8 @@ proc runVM*(vm: VM): void =
         vm.pc += 1
       of OPR:
         case iArg:
-          of 0:  # return
-            # prev. stktop
-            # dynamic link
-            # retaddr
-            vm.stk = vm.base-1
-            vm.pc = vm.stkmem[vm.stk+2]
-            vm.base = vm.stkmem[vm.stk+1]
+          of 0:
+            vm.pc += 1
           of 1:
             vm.stkmem[vm.stk] = -vm.stkmem[vm.stk]
             vm.pc += 1
@@ -100,7 +104,7 @@ proc runVM*(vm: VM): void =
             vm.pc += 1
           of 7:  # input
             stdout.write("? "); stdout.flushFile()
-            let z = stdin.readLine().parseInt
+            let z = stdin.readLine().parseInt.int16
             vm.stk += 1
             vm.stkmem[vm.stk] = z
             vm.pc += 1
@@ -130,12 +134,27 @@ proc runVM*(vm: VM): void =
             vm.pc += 1
           of 14:  # print
             echo vm.stkmem[vm.stk]
+            # stdout.write($vm.stkmem[vm.stk])
+            # stdout.flushFile()
             vm.stk -= 1
             vm.pc += 1
-          of 15:  # halt
-            break
+          of 15:
+            vm.stk -= 1
+            vm.stkmem[vm.stk] = vm.stkmem[vm.stk] mod vm.stkmem[vm.stk+1]
+            vm.pc += 1
           else:
             raise newException(ValueError, &"[VM] Unsupported OPR function: {iArg}")
+      of AND:
+        vm.stk -= 1
+        vm.stkmem[vm.stk] = if vm.stkmem[vm.stk] != 0 and vm.stkmem[vm.stk+1] != 0: 1 else: 0
+        vm.pc += 1
+      of OR:
+        vm.stk -= 1
+        vm.stkmem[vm.stk] = if vm.stkmem[vm.stk] != 0 or vm.stkmem[vm.stk+1] != 0: 1 else: 0
+        vm.pc += 1
+      of NOT:
+        vm.stkmem[vm.stk] = if vm.stkmem[vm.stk] != 0: 0 else: 1
+        vm.pc += 1
       of LOD:
         vm.stk += 1
         vm.stkmem[vm.stk] = vm.stkmem[vm.base + iArg]
@@ -190,6 +209,14 @@ proc runVM*(vm: VM): void =
         vm.stkmem[vm.a] = vm.stkmem[vm.stk]
         vm.stk -= 1
         vm.pc += 1
+      of RET:
+        # return
+        # prev. stktop
+        # dynamic link
+        # retaddr
+        vm.stk = vm.base-1
+        vm.pc = vm.stkmem[vm.stk+2]
+        vm.base = vm.stkmem[vm.stk+1]
 
 # NOTE THAT in the definition of JPC we jump when the stacktop is *0* but the
 # comparison operators leave *1* at the stack top when the conditio holds;

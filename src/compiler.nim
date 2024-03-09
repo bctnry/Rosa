@@ -101,6 +101,7 @@ proc compileExpr(x: Expr, env: Env): seq[Instr] =
                       of "-": 3
                       of "*": 4
                       of "/": 5
+                      of "%": 15
                       else: -1  # cannot happen
         res.add((OPR, opNum))
       of E_UNARYOP:
@@ -148,7 +149,6 @@ proc compileExpr(x: Expr, env: Env): seq[Instr] =
           res.add((LIT, lookupRes.get()))
           break dispatch
         x.raiseErrorWithReason(&"Cannot find the definition of {x.vName}")
-  echo "res ", x, res
   return res
 
 proc compileCond(x: Cond, env: Env): seq[Instr] =
@@ -172,6 +172,21 @@ proc compileCond(x: Cond, env: Env): seq[Instr] =
                     of ">": 12
                     else: -1  # cannot happen
       res.add((OPR, opNum))
+    of C_EXPR_NOT:
+      res &= x.nBody.compileCond(env)
+      res.add((NOT, 0))
+    of C_EXPR_BINOP:
+      case x.binOp:
+        of "and":
+          res &= x.binLhs.compileCond(env)
+          res &= x.binRhs.compileCond(env)
+          res.add((AND, 0))
+        of "or":
+          res &= x.binLhs.compileCond(env)
+          res &= x.binRhs.compileCond(env)
+          res.add((OR, 0))
+        else:
+          discard  # cannot happen
   return res
 
 # Now this gets slightly tricky. The branching instruction in the vm of the original
@@ -227,13 +242,12 @@ proc compileCond(x: Cond, env: Env): seq[Instr] =
 # to do that to work out the size and from the size the location; it's a mutual
 # dependent situation. The solution taken here is to first compile everything
 # but with placeholder CAL instructions and to fill in the actual value later.
-# the `seq[(int, int, string)]` part is for returning the location of such
-# instructions and the name of the called procedures. The second `int` part is
-# to maintain the proper layer count; this will become relevant in later parts.
-proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[Instr], seq[(int, int, string)])
-proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq[(int, int, string)]) =
+# the `seq[(int, string)]` part is for returning the location of such
+# instructions and the name of the called procedures. 
+proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[Instr], seq[(int, string)])
+proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq[(int, string)]) =
   var res: seq[Instr] = @[]
-  var callFillers: seq[(int, int, string)] = @[]
+  var callFillers: seq[(int, string)] = @[]
   case x.sType:
     of S_ASSIGN:
       block dispatch:
@@ -270,15 +284,49 @@ proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq
       res &= s[0]
       callFillers &= s[1]
     of S_IF:
-      let condPart: seq[Instr] = compileCond(x.ifCond, env)
-      res &= condPart
-      # the `+1` is for the JPC instr itself; it's the same case for S_WHILE.
-      let bodyPart = compileStatement(x.ifThen, currentLoc + condPart.len + 1, env)
-      let bodyInstr = bodyPart[0]
-      let bodyCallFillers = bodyPart[1]
-      res.add((JPC, currentLoc + condPart.len() + 1 + bodyInstr.len()))
-      res &= bodyInstr
-      callFillers &= bodyCallFillers
+      # if A1 then B1
+      # elif A2 then B2
+      # elif A3 then B3
+      # else B4
+      #
+      #     (A1)
+      #     JPC L1  (base + A1.len)
+      #     (B1)
+      #     JMP LX  (base + [A1,A2,A3].len+[B1,B2,B3].len+2*3+B4.len)
+      # L1: (A2)
+      #     JPC L2  (base + [A1,A2].len+[B1,B2].len+2*2)
+      #     (B2)
+      #     JMP LX
+      # L2: (A3)
+      #     JPC L3  (base + [A1,A1,A3].len+[B1,B2,B3].len+2*3)
+      #     (B3)
+      #     JMP LX
+      # L3: (B4)
+      # LX:
+      var branchRes: seq[Instr] = @[]
+      var counter = currentLoc
+      var stmtEnd: seq[int] = @[]
+      for b in x.branchList:
+        let branchCondRes = b[0].compileCond(env)
+        branchRes &= branchCondRes
+        counter += branchCondRes.len
+        let branchBodyRes = b[1].compileStatement(counter+1, env)
+        branchRes.add((JPC, counter+1+branchBodyRes[0].len+1))
+        counter += 1
+        callfillers &= branchBodyRes[1]
+        branchRes &= branchBodyRes[0]
+        counter += branchBodyRes[0].len
+        stmtEnd.add(branchRes.len)
+        branchRes.add((JMP, 0))
+        counter += 1
+      if x.elseBranch != nil:
+        let elseBody = x.elseBranch.compileStatement(counter, env)
+        branchRes &= elseBody[0]
+        counter += elseBody[0].len
+        callFillers &= elseBody[1]
+      for k in stmtEnd:
+        branchRes[k] = (JMP, counter)
+      res &= branchRes
     of S_WHILE:
       let l1 = currentLoc
       let condPart = compileCond(x.wCond, env)
@@ -311,12 +359,13 @@ proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq
             res.add((POPA, 0))
             res.add((POPR, 0))
     of S_PRINT:
-      res &= compileExpr(x.pExpr, env)
-      res.add((OPR, 14))
+      for e in x.pExpr:
+        res &= compileExpr(e, env)
+        res.add((OPR, 14))
     of S_RETURN:
       res &= compileExpr(x.rExpr, env)
       res.add((POPA, 0))
-      res.add((OPR, 0))
+      res.add((RET, 0))
     of S_CALL:
       let lookupRes = env.lookupProc(x.cTarget)
       if lookupRes.isSome():
@@ -330,7 +379,7 @@ proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq
           cnt += argRes.len
       # inserting placeholder call instr.
       res.add((CAL, 0))
-      callFillers.add((cnt, 0, x.cTarget))
+      callFillers.add((cnt, x.cTarget))
       if x.cArgs.len > 0:
         for a in x.cArgs:
           res.add((POP, 0))
@@ -341,9 +390,9 @@ proc compileStatement(x: Statement, currentLoc: int, env: Env): (seq[Instr], seq
       # signature before actually compiling them.
   return (res, callFillers)
 
-proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[Instr], seq[(int, int, string)]) =
+proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[Instr], seq[(int, string)]) =
   var res: seq[Instr] = @[]
-  var callFillers: seq[(int, int, string)] = @[]
+  var callFillers: seq[(int, string)] = @[]
   var cnt = currentLoc
   for stmt in x:
     let stmtRes = stmt.compileStatement(cnt, env)
@@ -442,29 +491,29 @@ proc compileStatementList(x: seq[Statement], currentLoc: int, env: Env): (seq[In
 # environment to enable recursion. The name of the proc, when resolving, has
 # a depth of 1 (instead of 0 like calling local procedures) since technically
 # lives in the parent scope.
-proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[string, int]): (seq[Instr], seq[(int, int, string)])
-proc compileProcDef(x: ProcDef, currentLoc: int, env: var Env): (seq[Instr], seq[(int, int, string)]) =
+proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[string, int]): (seq[Instr], seq[(int, string)])
+proc compileProcDef(x: ProcDef, currentLoc: int, env: var Env): (seq[Instr], seq[(int, string)]) =
   let argTable = x.assignParams()
   let res = x.body.compileBlock(currentLoc, env, argTable)
   var resInstrList = res[0]
-  var newCallFillers: seq[(int, int, string)] = @[]
+  var newCallFillers: seq[(int, string)] = @[]
   for c in res[1]:
     let calLoc = c[0]
-    let calName = c[2]
+    let calName = c[1]
     if calName == x.name:
       resInstrList[calLoc-currentLoc] = (CAL, currentLoc)
     else:
-      newCallFillers.add((c[0], c[1]+1, c[2]))
-  resInstrList.add((OPR, 0))
+      newCallFillers.add((c[0], c[1]))
+  resInstrList.add((RET, 0))
   return (resInstrList, newCallFillers)
 
-proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[string, int]): (seq[Instr], seq[(int, int, string)]) =
+proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[string, int]): (seq[Instr], seq[(int, string)]) =
   # echo "compiling ", name, " at loc ", currentLoc, " at layer ", layerCount
   var blockBase = currentLoc
   let constTable = if x.constDef.len <= 0: nil else: x.constDef.collectConst
   var res: seq[Instr] = @[]
-  var callFillers: seq[(int, int, string)] = @[]
-  var procTable: TableRef[string, tuple[loc: int, arity: int]] = newTable[string, tuple[loc: int, arity: int]]()
+  var callFillers: seq[(int, string)] = @[]
+  var procTable: TableRef[string, tuple[loc: int, arity: int]] = nil
   var varTable: TableRef[string, int] = nil
   if x.varDef.len > 0:
     res.add((INT, x.varDef.len))
@@ -484,13 +533,10 @@ proc compileBlock(x: Block, currentLoc: int, env: var Env, argTable: TableRef[st
   let bodyCallFillers = bodyRes[1]
   for c in bodyCallFillers:
     let calLoc = c[0]
-    let calName = c[2]
-    if procTable.hasKey(calName):
-      res[calLoc-currentLoc] = (CAL, procTable[calName].loc)
-    else:
-      callFillers.add((c[0], c[1], c[2]))
+    let calName = c[1]
+    callFillers.add((c[0], c[1]))
   return (res, callFillers)
-proc compileBlock(x: Block, currentLoc: int, env: var Env): (seq[Instr], seq[(int, int, string)]) =
+proc compileBlock(x: Block, currentLoc: int, env: var Env): (seq[Instr], seq[(int, string)]) =
   compileBlock(x, currentLoc, env, nil)
 
 proc compileProgram*(x: Program): seq[Instr] =
@@ -498,7 +544,7 @@ proc compileProgram*(x: Program): seq[Instr] =
   var blockBase = 0
   let constTable = if x.constDef.len <= 0: nil else: x.constDef.collectConst
   var res: seq[Instr] = @[]
-  var callFillers: seq[(int, int, string)] = @[]
+  var callFillers: seq[(int, string)] = @[]
   var procTable: TableRef[string, tuple[loc: int, arity: int]] = newTable[string, tuple[loc: int, arity: int]]()
   var varTable: TableRef[string, int] = nil
   var globalTable: TableRef[string, int] = nil
@@ -539,14 +585,14 @@ proc compileProgram*(x: Program): seq[Instr] =
       procLocationCount += pRes[0].len
     # NOTE: since the whole proc starts at currentLoc, one can find the
     # relative location of the CALs by i-currentLoc.
-    var newCallFillers: seq[(int, int, string)] = @[]
+    var newCallFillers: seq[(int, string)] = @[]
     for c in callFillers:
       let calLoc = c[0]
-      let calName = c[2]
+      let calName = c[1]
       if procTable.hasKey(calName):
         res[calLoc] = (CAL, procTable[calName].loc)
       else:
-        newCallFillers.add((c[0], c[1], c[2]))
+        newCallFillers.add((c[0], c[1]))
     callFillers = newCallFillers
     # resolving the JMP we setup in the beginning...
     res[blockBase-1] = (JMP, procLocationCount)
@@ -558,11 +604,11 @@ proc compileProgram*(x: Program): seq[Instr] =
   let bodyCallFillers = bodyRes[1]
   for c in bodyCallFillers:
     let calLoc = c[0]
-    let calName = c[2]
+    let calName = c[1]
     if procTable.hasKey(calName):
       res[calLoc] = (CAL, procTable[calName].loc)
     else:
-      callFillers.add((c[0], c[1]+1, c[2]))
+      callFillers.add((c[0], c[1]))
 
   assert callfillers.len <= 0
   return res
